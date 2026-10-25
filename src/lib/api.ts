@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import type { DashboardSummary, Movement, Product, StockReportRow } from "./types";
 
 const demoProducts: Product[] = [
@@ -101,6 +102,22 @@ export const recordMovement = (type: "purchase" | "sale" | "adjustment", input: 
 
 export const getStockReport = (fromDate: string, toDate: string) =>
   call<StockReportRow[]>("get_stock_report", { fromDate, toDate }, []);
+
+// Both return null when the file dialog is cancelled or there is no desktop app to show one.
+export async function exportStockReport(fromDate: string, toDate: string, format: "csv" | "xlsx") {
+  if (!isTauri()) return null;
+  const destination = await save({
+    defaultPath: `stocklite-report-${fromDate}-to-${toDate}.${format}`,
+    filters: [{ name: format === "csv" ? "CSV" : "Excel workbook", extensions: [format] }],
+  });
+  return destination ? invoke<string>("export_stock_report", { fromDate, toDate, destination }) : null;
+}
+
+export async function importSpreadsheet(kind: "products" | "movements") {
+  if (!isTauri()) return null;
+  const source = await open({ filters: [{ name: "Spreadsheet", extensions: ["csv", "xlsx", "xls", "ods"] }] });
+  return source ? invoke<number>(`import_${kind}`, { source }) : null;
+}
 
 export const createBackup = (destination: string) => call<string>("create_backup", { destination }, destination);
 export const restoreBackup = (source: string) => call<void>("restore_backup", { source }, undefined);

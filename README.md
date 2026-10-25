@@ -56,6 +56,9 @@ the macOS, Windows, Debian/Ubuntu, and Fedora/RHEL installers.
 - Protection against negative inventory and overselling
 - Backdated movements with separate recorded timestamps
 - Searchable transaction history and stock reports
+- Stock report export to CSV and Excel (.xlsx)
+- Bulk import of products and transactions from CSV or Excel files, all-or-nothing
+- Duplicate product name warnings and suggestions while typing
 - Consistent SQLite backups and validated restores
 - Offline-first local database
 

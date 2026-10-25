@@ -1,6 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -207,16 +208,28 @@ fn create_product(
     opening_quantity: i64,
     reorder_threshold: Option<i64>,
 ) -> Result<Product, String> {
-    let (name, unit) = normalize_product_fields(&name, &unit);
+    let mut connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
+    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    let product_id = insert_product(&transaction, &name, &unit, opening_quantity, reorder_threshold)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    get_product(&connection, product_id)
+}
+
+fn insert_product(
+    transaction: &Connection,
+    name: &str,
+    unit: &str,
+    opening_quantity: i64,
+    reorder_threshold: Option<i64>,
+) -> Result<i64, String> {
+    let (name, unit) = normalize_product_fields(name, unit);
     if name.is_empty() || unit.is_empty() {
         return Err("Product name and unit are required.".to_string());
     }
     if opening_quantity < 0 || reorder_threshold.is_some_and(|value| value < 0) {
         return Err("Quantities cannot be negative.".to_string());
     }
-    let mut connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
-    let transaction = connection.transaction().map_err(|error| error.to_string())?;
-    ensure_unique_name(&transaction, &name, None)?;
+    ensure_unique_name(transaction, &name, None)?;
     let next_id: i64 = transaction
         .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM products", [], |row| row.get(0))
         .map_err(|error| error.to_string())?;
@@ -240,8 +253,7 @@ fn create_product(
             )
             .map_err(|error| error.to_string())?;
     }
-    transaction.commit().map_err(|error| error.to_string())?;
-    get_product(&connection, product_id)
+    Ok(product_id)
 }
 
 #[tauri::command]
@@ -345,6 +357,14 @@ fn get_product(connection: &Connection, product_id: i64) -> Result<Product, Stri
 }
 
 fn record_movement(connection: &mut Connection, input: MovementInput, movement_type: &str) -> Result<Product, String> {
+    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    let product_id = input.product_id;
+    insert_movement(&transaction, input, movement_type)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    get_product(connection, product_id)
+}
+
+fn insert_movement(transaction: &Connection, input: MovementInput, movement_type: &str) -> Result<(), String> {
     if (movement_type != "adjustment" && input.quantity <= 0) || (movement_type == "adjustment" && input.quantity == 0) {
         return Err(if movement_type == "adjustment" {
             "Adjustment cannot be zero.".to_string()
@@ -352,7 +372,6 @@ fn record_movement(connection: &mut Connection, input: MovementInput, movement_t
             "Quantity must be greater than zero.".to_string()
         });
     }
-    let transaction = connection.transaction().map_err(|error| error.to_string())?;
     let active: Option<i64> = transaction
         .query_row("SELECT id FROM products WHERE id = ?1 AND is_active = 1", [input.product_id], |row| row.get(0))
         .optional()
@@ -387,9 +406,7 @@ fn record_movement(connection: &mut Connection, input: MovementInput, movement_t
             params![input.product_id, movement_type, delta, occurred_at, input.note],
         )
     };
-    result.map_err(|error| error.to_string())?;
-    transaction.commit().map_err(|error| error.to_string())?;
-    get_product(connection, input.product_id)
+    result.map(|_| ()).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -501,14 +518,14 @@ fn get_stock_report(
     from_date: String,
     to_date: String,
 ) -> Result<Vec<StockReportRow>, String> {
-    if from_date > to_date {
-        return Err("The report start date must be before its end date.".to_string());
-    }
     let connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
     stock_report(&connection, &from_date, &to_date)
 }
 
 fn stock_report(connection: &Connection, from_date: &str, to_date: &str) -> Result<Vec<StockReportRow>, String> {
+    if from_date > to_date {
+        return Err("The report start date must be before its end date.".to_string());
+    }
     let mut statement = connection
         .prepare(
             "SELECT p.id, p.name, p.unit,
@@ -537,6 +554,204 @@ fn stock_report(connection: &Connection, from_date: &str, to_date: &str) -> Resu
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn export_stock_report(
+    state: State<'_, AppState>,
+    from_date: String,
+    to_date: String,
+    destination: String,
+) -> Result<String, String> {
+    let rows = {
+        let connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
+        stock_report(&connection, &from_date, &to_date)?
+    };
+    write_report(&rows, Path::new(&destination))?;
+    Ok(destination)
+}
+
+const REPORT_HEADERS: [&str; 7] = ["Product", "Unit", "Opening", "Purchases", "Sales", "Adjustments", "Closing"];
+
+fn write_report(rows: &[StockReportRow], destination: &Path) -> Result<(), String> {
+    let numbers = |row: &StockReportRow| [row.opening_balance, row.purchases, row.sales, row.adjustments, row.closing_balance];
+    match destination.extension().and_then(|value| value.to_str()) {
+        Some("csv") => {
+            let mut writer = csv::Writer::from_path(destination).map_err(|error| error.to_string())?;
+            writer.write_record(REPORT_HEADERS).map_err(|error| error.to_string())?;
+            for row in rows {
+                let mut record = vec![row.product_name.clone(), row.unit.clone()];
+                record.extend(numbers(row).map(|value| value.to_string()));
+                writer.write_record(record).map_err(|error| error.to_string())?;
+            }
+            writer.flush().map_err(|error| error.to_string())
+        }
+        Some("xlsx") => {
+            let mut workbook = rust_xlsxwriter::Workbook::new();
+            let sheet = workbook.add_worksheet().set_name("Stock report").map_err(|error| error.to_string())?;
+            sheet
+                .write_row_with_format(0, 0, REPORT_HEADERS, &rust_xlsxwriter::Format::new().set_bold())
+                .map_err(|error| error.to_string())?;
+            for (index, row) in rows.iter().enumerate() {
+                let line = index as u32 + 1;
+                sheet.write_row(line, 0, [&row.product_name, &row.unit]).map_err(|error| error.to_string())?;
+                sheet.write_row(line, 2, numbers(row).map(|value| value as f64)).map_err(|error| error.to_string())?;
+            }
+            sheet.autofit();
+            workbook.save(destination).map_err(|error| error.to_string())
+        }
+        _ => Err("Export files must use the .csv or .xlsx extension.".to_string()),
+    }
+}
+
+/// First sheet (or the CSV) as text cells; Excel dates become YYYY-MM-DD.
+fn read_spreadsheet(source: &Path) -> Result<Vec<Vec<String>>, String> {
+    if source.extension().and_then(|value| value.to_str()).is_some_and(|value| value.eq_ignore_ascii_case("csv")) {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_path(source)
+            .map_err(|error| format!("Could not open file: {error}"))?;
+        // Byte records so files saved in a legacy Excel encoding still import instead of failing outright.
+        return reader
+            .byte_records()
+            .map(|record| {
+                record
+                    .map(|record| record.iter().map(|cell| String::from_utf8_lossy(cell).into_owned()).collect())
+                    .map_err(|error| error.to_string())
+            })
+            .collect();
+    }
+    use calamine::{Data, Reader};
+    let mut workbook = calamine::open_workbook_auto(source).map_err(|error| format!("Could not open spreadsheet: {error}"))?;
+    let range = workbook
+        .worksheet_range_at(0)
+        .ok_or("The spreadsheet has no sheets.")?
+        .map_err(|error| error.to_string())?;
+    Ok(range
+        .rows()
+        .map(|row| {
+            row.iter()
+                .map(|cell| match cell {
+                    Data::DateTime(value) => value.as_datetime().map(|date| date.date().to_string()).unwrap_or_default(),
+                    Data::DateTimeIso(value) => value.chars().take(10).collect(),
+                    other => other.to_string(),
+                })
+                .collect()
+        })
+        .collect())
+}
+
+type ImportRecord = HashMap<String, String>;
+
+/// Non-blank data rows keyed by lowercased header, with their spreadsheet row number for error messages.
+fn read_import_records(source: &Path, required: &[&str]) -> Result<Vec<(usize, ImportRecord)>, String> {
+    let mut rows = read_spreadsheet(source)?.into_iter();
+    let headers: Vec<String> = rows
+        .next()
+        .unwrap_or_default()
+        .iter()
+        .map(|header| header.trim_start_matches('\u{feff}').trim().to_lowercase().replace('_', " "))
+        .collect();
+    if let Some(missing) = required.iter().find(|column| !headers.iter().any(|header| header == *column)) {
+        return Err(format!("The first row must contain a \"{missing}\" column header."));
+    }
+    Ok(rows
+        .enumerate()
+        .filter(|(_, row)| row.iter().any(|cell| !cell.trim().is_empty()))
+        .map(|(index, row)| (index + 2, headers.iter().cloned().zip(row.into_iter().map(|cell| cell.trim().to_string())).collect()))
+        .collect())
+}
+
+fn field<'a>(record: &'a ImportRecord, column: &str) -> &'a str {
+    record.get(column).map_or("", String::as_str)
+}
+
+fn whole_number(record: &ImportRecord, column: &str) -> Result<Option<i64>, String> {
+    let value = field(record, column);
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value.parse().map(Some).map_err(|_| format!("\"{column}\" must be a whole number, not \"{value}\"."))
+}
+
+/// All rows commit together, so a bad row never leaves a half-imported file behind.
+fn import_records(
+    connection: &mut Connection,
+    records: &[(usize, ImportRecord)],
+    import_row: fn(&Connection, &ImportRecord) -> Result<(), String>,
+) -> Result<usize, String> {
+    if records.is_empty() {
+        return Err("The file has no rows to import.".to_string());
+    }
+    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    for (row, record) in records {
+        import_row(&transaction, record).map_err(|error| format!("Row {row}: {error}"))?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(records.len())
+}
+
+fn import_product_row(transaction: &Connection, record: &ImportRecord) -> Result<(), String> {
+    let opening_quantity = whole_number(record, "opening stock")?.unwrap_or(0);
+    let reorder_threshold = whole_number(record, "reorder threshold")?;
+    insert_product(transaction, field(record, "name"), field(record, "unit"), opening_quantity, reorder_threshold).map(|_| ())
+}
+
+fn import_movement_row(transaction: &Connection, record: &ImportRecord) -> Result<(), String> {
+    let movement_type = field(record, "type").to_lowercase();
+    if !["purchase", "sale", "adjustment"].contains(&movement_type.as_str()) {
+        return Err("\"type\" must be purchase, sale, or adjustment.".to_string());
+    }
+    let product = field(record, "product");
+    let product_id: i64 = transaction
+        .query_row(
+            "SELECT id FROM products WHERE product_code = ?1 COLLATE NOCASE OR name = ?1
+             ORDER BY product_code = ?1 COLLATE NOCASE DESC LIMIT 1",
+            [product],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Product \"{product}\" was not found."))?;
+    let quantity = whole_number(record, "quantity")?.ok_or("\"quantity\" is required.")?;
+    let occurred_at = field(record, "date");
+    if !occurred_at.is_empty() {
+        let valid: bool = transaction
+            .query_row("SELECT date(?1) IS ?1", [occurred_at], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if !valid {
+            return Err(format!("\"date\" must look like 2026-10-25, not \"{occurred_at}\"."));
+        }
+    }
+    let note = Some(field(record, "note").to_string()).filter(|value| !value.is_empty());
+    insert_movement(
+        transaction,
+        MovementInput { product_id, quantity, occurred_at: Some(occurred_at.to_string()), note },
+        &movement_type,
+    )
+}
+
+fn import_products_file(connection: &mut Connection, source: &Path) -> Result<usize, String> {
+    let records = read_import_records(source, &["name", "unit"])?;
+    import_records(connection, &records, import_product_row)
+}
+
+fn import_movements_file(connection: &mut Connection, source: &Path) -> Result<usize, String> {
+    let records = read_import_records(source, &["product", "type", "quantity"])?;
+    import_records(connection, &records, import_movement_row)
+}
+
+#[tauri::command]
+fn import_products(state: State<'_, AppState>, source: String) -> Result<usize, String> {
+    let mut connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
+    import_products_file(&mut connection, Path::new(&source))
+}
+
+#[tauri::command]
+fn import_movements(state: State<'_, AppState>, source: String) -> Result<usize, String> {
+    let mut connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
+    import_movements_file(&mut connection, Path::new(&source))
 }
 
 #[tauri::command]
@@ -756,6 +971,87 @@ mod tests {
         assert!(ensure_unique_name(&connection, "Rod", Some(2)).is_err());
         assert!(ensure_unique_name(&connection, "Bolt", None).is_ok());
     }
+
+    fn temp_file(name: &str, contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("stocklite-{}-{name}", std::process::id()));
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn product_import_creates_all_rows_or_none() {
+        let mut connection = database();
+        let good = temp_file("products.csv", "\u{feff}Name,Unit,Opening_Stock,Reorder Threshold\n\"Coffee, dark\",BAGS,12,3\n\nfilters,boxes,,\n");
+        assert_eq!(import_products_file(&mut connection, &good).unwrap(), 2);
+        let coffee = get_product(&connection, 1).unwrap();
+        assert_eq!((coffee.name.as_str(), coffee.unit.as_str(), coffee.current_stock, coffee.reorder_threshold), ("Coffee, Dark", "bags", 12, Some(3)));
+        let bad = temp_file("products-bad.csv", "name,unit,opening stock\nRod,pieces,5\nfilters,boxes,1\n");
+        assert_eq!(import_products_file(&mut connection, &bad).unwrap_err(), "Row 3: A product with this name already exists.");
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM products", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+        let missing = temp_file("products-missing.csv", "name\nRod\n");
+        assert!(import_products_file(&mut connection, &missing).unwrap_err().contains("\"unit\""));
+        for path in [good, bad, missing] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn movement_import_matches_products_and_rolls_back_on_errors() {
+        let mut connection = database();
+        connection.execute("INSERT INTO products (product_code, name, unit) VALUES ('STK-0001', 'Rod', 'pieces')", []).unwrap();
+        let good = temp_file("movements.csv", "date,product,type,quantity,note\n2026-10-01,stk-0001,Purchase,10,Supplier\n,rod,sale,4,\n2026-10-03,Rod,adjustment,-1,Damaged\n");
+        assert_eq!(import_movements_file(&mut connection, &good).unwrap(), 3);
+        assert_eq!(get_product(&connection, 1).unwrap().current_stock, 5);
+        for (contents, error) in [
+            ("product,type,quantity\nRod,purchase,1\nRod,sale,7\n", "Row 3: Not enough stock. Available balance is 6."),
+            ("product,type,quantity\nPipe,purchase,1\n", "Row 2: Product \"Pipe\" was not found."),
+            ("product,type,quantity,date\nRod,purchase,1,25/10/2026\n", "Row 2: \"date\" must look like 2026-10-25, not \"25/10/2026\"."),
+            ("product,type,quantity\nRod,opening,1\n", "Row 2: \"type\" must be purchase, sale, or adjustment."),
+            ("product,type,quantity\nRod,purchase,1.5\n", "Row 2: \"quantity\" must be a whole number, not \"1.5\"."),
+        ] {
+            let bad = temp_file("movements-bad.csv", contents);
+            assert_eq!(import_movements_file(&mut connection, &bad).unwrap_err(), error);
+            fs::remove_file(bad).unwrap();
+        }
+        assert_eq!(get_product(&connection, 1).unwrap().current_stock, 5);
+        fs::remove_file(good).unwrap();
+    }
+
+    #[test]
+    fn report_exports_read_back_as_the_same_table() {
+        let mut connection = database();
+        product_with_timestamped_opening_and_dated_purchase(&mut connection);
+        let rows = stock_report(&connection, "2026-10-01", "2026-10-31").unwrap();
+        for extension in ["csv", "xlsx"] {
+            let path = std::env::temp_dir().join(format!("stocklite-{}-report.{extension}", std::process::id()));
+            write_report(&rows, &path).unwrap();
+            assert_eq!(
+                read_spreadsheet(&path).unwrap(),
+                vec![REPORT_HEADERS.map(String::from).to_vec(), ["Rod", "pieces", "1000", "7", "0", "0", "1007"].map(String::from).to_vec()],
+                "{extension}"
+            );
+            fs::remove_file(path).unwrap();
+        }
+        assert!(write_report(&rows, Path::new("report.pdf")).is_err());
+    }
+
+    #[test]
+    fn excel_date_cells_import_as_calendar_days() {
+        let mut connection = database();
+        connection.execute("INSERT INTO products (product_code, name, unit) VALUES ('STK-0001', 'Rod', 'pieces')", []).unwrap();
+        let path = std::env::temp_dir().join(format!("stocklite-{}-movements.xlsx", std::process::id()));
+        let mut workbook = rust_xlsxwriter::Workbook::new();
+        let sheet = workbook.add_worksheet();
+        sheet.write_row(0, 0, ["Product", "Type", "Quantity", "Date"]).unwrap();
+        sheet.write_row(1, 0, ["Rod", "purchase"]).unwrap();
+        sheet.write(1, 2, 3).unwrap();
+        let date = rust_xlsxwriter::ExcelDateTime::from_ymd(2026, 10, 25).unwrap();
+        sheet.write_datetime_with_format(1, 3, &date, &rust_xlsxwriter::Format::new().set_num_format("yyyy-mm-dd")).unwrap();
+        workbook.save(&path).unwrap();
+        assert_eq!(import_movements_file(&mut connection, &path).unwrap(), 1);
+        assert_eq!(query_movements(&connection, 1).unwrap()[0].occurred_at, "2026-10-25");
+        fs::remove_file(path).unwrap();
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -775,6 +1071,7 @@ pub fn run() {
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             list_products,
             create_product,
@@ -788,6 +1085,9 @@ pub fn run() {
             list_movements,
             get_dashboard_summary,
             get_stock_report,
+            export_stock_report,
+            import_products,
+            import_movements,
             create_backup,
             restore_backup,
             get_database_path
