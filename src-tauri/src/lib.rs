@@ -162,6 +162,13 @@ fn create_product(
     }
     let mut connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
     let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    let duplicate: Option<i64> = transaction
+        .query_row("SELECT id FROM products WHERE name = ?1 COLLATE NOCASE", [name], |row| row.get(0))
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if duplicate.is_some() {
+        return Err("A product with this name already exists.".to_string());
+    }
     let next_id: i64 = transaction
         .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM products", [], |row| row.get(0))
         .map_err(|error| error.to_string())?;
@@ -241,10 +248,21 @@ fn get_product(connection: &Connection, product_id: i64) -> Result<Product, Stri
 }
 
 fn record_movement(connection: &mut Connection, input: MovementInput, movement_type: &str) -> Result<Product, String> {
-    if input.quantity <= 0 {
-        return Err("Quantity must be greater than zero.".to_string());
+    if (movement_type != "adjustment" && input.quantity <= 0) || (movement_type == "adjustment" && input.quantity == 0) {
+        return Err(if movement_type == "adjustment" {
+            "Adjustment cannot be zero.".to_string()
+        } else {
+            "Quantity must be greater than zero.".to_string()
+        });
     }
     let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    let active: Option<i64> = transaction
+        .query_row("SELECT id FROM products WHERE id = ?1 AND is_active = 1", [input.product_id], |row| row.get(0))
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if active.is_none() {
+        return Err("Product was not found or is archived.".to_string());
+    }
     let current: i64 = transaction
         .query_row(
             "SELECT COALESCE(SUM(m.quantity_delta), 0) FROM movements m
@@ -345,7 +363,9 @@ fn get_dashboard_summary(state: State<'_, AppState>) -> Result<DashboardSummary,
     let total_units = connection
         .query_row(
             "SELECT COALESCE(SUM(balance), 0) FROM
-             (SELECT COALESCE(SUM(quantity_delta), 0) AS balance FROM movements GROUP BY product_id)",
+             (SELECT COALESCE(SUM(m.quantity_delta), 0) AS balance
+              FROM movements m JOIN products p ON p.id = m.product_id
+              WHERE p.is_active = 1 GROUP BY m.product_id)",
             [],
             |row| row.get(0),
         )
@@ -424,6 +444,12 @@ fn create_backup(state: State<'_, AppState>, destination: String) -> Result<Stri
     if destination.extension().and_then(|value| value.to_str()) != Some("db") {
         return Err("Backup files must use the .db extension.".to_string());
     }
+    let current_path: String = connection
+        .query_row("PRAGMA database_list", [], |row| row.get(2))
+        .map_err(|error| error.to_string())?;
+    if Path::new(&current_path) == destination {
+        return Err("Choose a backup path different from the active database.".to_string());
+    }
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
@@ -440,12 +466,27 @@ fn restore_backup(state: State<'_, AppState>, source: String) -> Result<(), Stri
         return Err("Backup files must use the .db extension.".to_string());
     }
     let backup = Connection::open(source).map_err(|error| error.to_string())?;
-    initialize_database(&backup).map_err(|error| format!("Invalid backup: {error}"))?;
     backup
         .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
         .map_err(|error| error.to_string())
         .and_then(|result| if result == "ok" { Ok(()) } else { Err(format!("Backup failed integrity check: {result}")) })?;
+    let has_schema: i64 = backup
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('products', 'movements')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if has_schema != 2 {
+        return Err("Backup does not contain a compatible StockLite database.".to_string());
+    }
     let mut connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
+    let current_path: String = connection
+        .query_row("PRAGMA database_list", [], |row| row.get(2))
+        .map_err(|error| error.to_string())?;
+    if Path::new(&current_path) == source {
+        return Err("Choose a backup file different from the active database.".to_string());
+    }
     connection.execute_batch("PRAGMA foreign_keys = OFF;").map_err(|error| error.to_string())?;
     let restore = rusqlite::backup::Backup::new(&backup, &mut connection).map_err(|error| error.to_string())?;
     restore.run_to_completion(100, std::time::Duration::from_millis(10), None).map_err(|error| error.to_string())?;
@@ -484,6 +525,18 @@ mod tests {
         assert!(error.contains("Not enough stock"));
         let balance: i64 = connection.query_row("SELECT SUM(quantity_delta) FROM movements", [], |row| row.get(0)).unwrap();
         assert_eq!(balance, 115);
+    }
+
+    #[test]
+    fn adjustments_support_signed_corrections_without_negative_stock() {
+        let mut connection = database();
+        connection.execute("INSERT INTO products (product_code, name, unit) VALUES ('STK-0001', 'Filters', 'boxes')", []).unwrap();
+        let product_id = connection.last_insert_rowid();
+        record_movement(&mut connection, MovementInput { product_id, quantity: 12, occurred_at: None, note: None }, "opening").unwrap();
+        record_movement(&mut connection, MovementInput { product_id, quantity: -3, occurred_at: None, note: Some("Damaged".into()) }, "adjustment").unwrap();
+        let balance: i64 = connection.query_row("SELECT SUM(quantity_delta) FROM movements", [], |row| row.get(0)).unwrap();
+        assert_eq!(balance, 9);
+        assert!(record_movement(&mut connection, MovementInput { product_id, quantity: -10, occurred_at: None, note: None }, "adjustment").is_err());
     }
 
     #[test]

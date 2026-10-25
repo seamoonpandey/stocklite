@@ -4,6 +4,7 @@ export type Product = {
   name: string;
   unit: string;
   currentStock: number;
+  reorderThreshold: number | null;
   isActive: boolean;
 };
 
@@ -15,6 +16,18 @@ export type Movement = {
   quantityDelta: number;
   occurredAt: string;
   note?: string;
+  createdAt: string;
+};
+
+export type StockReportRow = {
+  productId: number;
+  productName: string;
+  unit: string;
+  openingBalance: number;
+  purchases: number;
+  sales: number;
+  adjustments: number;
+  closingBalance: number;
 };
 
 export type DashboardSummary = {
