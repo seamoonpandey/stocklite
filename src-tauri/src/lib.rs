@@ -98,7 +98,21 @@ fn initialize_database(connection: &Connection) -> rusqlite::Result<()> {
     if !has_version {
         connection.execute("INSERT INTO schema_versions (version) VALUES (1)", [])?;
     }
-
+    let existing_products: Vec<(i64, String, String)> = {
+        let mut statement = connection.prepare("SELECT id, name, unit FROM products")?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (id, name, unit) in existing_products {
+        let (normalized_name, normalized_unit) = normalize_product_fields(&name, &unit);
+        if normalized_name != name || normalized_unit != unit {
+            connection.execute(
+                "UPDATE products SET name = ?1, unit = ?2 WHERE id = ?3",
+                params![normalized_name, normalized_unit, id],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -134,6 +148,24 @@ fn product_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Product> {
         reorder_threshold: row.get(5)?,
         is_active: row.get::<_, i64>(6)? == 1,
     })
+}
+
+fn title_case(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_product_fields(name: &str, unit: &str) -> (String, String) {
+    (title_case(name.trim()), unit.trim().to_lowercase())
 }
 
 fn product_query(include_inactive: bool) -> &'static str {
@@ -175,8 +207,7 @@ fn create_product(
     opening_quantity: i64,
     reorder_threshold: Option<i64>,
 ) -> Result<Product, String> {
-    let name = name.trim();
-    let unit = unit.trim();
+    let (name, unit) = normalize_product_fields(&name, &unit);
     if name.is_empty() || unit.is_empty() {
         return Err("Product name and unit are required.".to_string());
     }
@@ -186,7 +217,7 @@ fn create_product(
     let mut connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
     let transaction = connection.transaction().map_err(|error| error.to_string())?;
     let duplicate: Option<i64> = transaction
-        .query_row("SELECT id FROM products WHERE name = ?1 COLLATE NOCASE", [name], |row| row.get(0))
+        .query_row("SELECT id FROM products WHERE name = ?1 COLLATE NOCASE", [&name], |row| row.get(0))
         .optional()
         .map_err(|error| error.to_string())?;
     if duplicate.is_some() {
@@ -227,8 +258,7 @@ fn update_product(
     unit: String,
     reorder_threshold: Option<i64>,
 ) -> Result<Product, String> {
-    let name = name.trim();
-    let unit = unit.trim();
+    let (name, unit) = normalize_product_fields(&name, &unit);
     if name.is_empty() || unit.is_empty() {
         return Err("Product name and unit are required.".to_string());
     }
@@ -256,6 +286,24 @@ fn archive_product(state: State<'_, AppState>, product_id: i64) -> Result<(), St
         .map_err(|error| error.to_string())?;
     if changed == 0 {
         return Err("Product was not found or already archived.".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_product(state: State<'_, AppState>, product_id: i64) -> Result<(), String> {
+    let connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
+    let movement_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM movements WHERE product_id = ?1", [product_id], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if movement_count > 0 {
+        return Err("This product has transaction history and cannot be deleted. Archive it instead.".to_string());
+    }
+    let deleted = connection
+        .execute("DELETE FROM products WHERE id = ?1", [product_id])
+        .map_err(|error| error.to_string())?;
+    if deleted == 0 {
+        return Err("Product was not found.".to_string());
     }
     Ok(())
 }
@@ -584,6 +632,19 @@ mod tests {
         assert_eq!(migrated.query_row("SELECT name FROM products", [], |row| row.get::<_, String>(0)).unwrap(), "Legacy item");
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn product_fields_are_normalized_and_history_blocks_deletion() {
+        let (name, unit) = normalize_product_fields("  arabica COFFEE beans ", " BAGS ");
+        assert_eq!(name, "Arabica Coffee Beans");
+        assert_eq!(unit, "bags");
+        let mut connection = database();
+        connection.execute("INSERT INTO products (product_code, name, unit) VALUES ('STK-0001', ?1, ?2)", params![name, unit]).unwrap();
+        let product_id = connection.last_insert_rowid();
+        record_movement(&mut connection, MovementInput { product_id, quantity: 1, occurred_at: None, note: None }, "opening").unwrap();
+        let history_count: i64 = connection.query_row("SELECT COUNT(*) FROM movements WHERE product_id = ?1", [product_id], |row| row.get(0)).unwrap();
+        assert_eq!(history_count, 1);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -608,6 +669,7 @@ pub fn run() {
             create_product,
             update_product,
             archive_product,
+            delete_product,
             record_purchase,
             record_sale,
             record_adjustment,

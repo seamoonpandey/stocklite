@@ -81,6 +81,7 @@ export const updateProduct = (input: {
   });
 
 export const archiveProduct = (productId: number) => call<void>("archive_product", { productId }, undefined);
+export const deleteProduct = (productId: number) => call<void>("delete_product", { productId }, undefined);
 
 export const recordMovement = (type: "purchase" | "sale" | "adjustment", input: {
   productId: number;

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import {
-    archiveProduct, createBackup, createProduct, getDashboardSummary, getDatabasePath,
+    archiveProduct, createBackup, createProduct, deleteProduct, getDashboardSummary, getDatabasePath,
     getStockReport, listMovements, listProducts, recordMovement, restoreBackup, updateProduct,
   } from "$lib/api";
   import type { DashboardSummary, Movement, Product, StockReportRow } from "$lib/types";
@@ -42,6 +42,7 @@
   let note = $state("");
   let isSaving = $state(false);
   let isLoading = $state(false);
+  let refreshSequence = 0;
   let error = $state("");
   let notice = $state("");
   let backupPath = $state("");
@@ -56,11 +57,18 @@
 
   onMount(async () => { await refresh(); databasePath = await getDatabasePath(); });
   async function refresh() {
+    const sequence = ++refreshSequence;
     isLoading = true;
     try {
-      [products, allProducts, movements, summary] = await Promise.all([
+      const [nextProducts, nextAllProducts, nextMovements, nextSummary] = await Promise.all([
         listProducts(), listProducts("", true), listMovements(), getDashboardSummary(),
       ]);
+      if (sequence === refreshSequence) {
+        products = nextProducts;
+        allProducts = nextAllProducts;
+        movements = nextMovements;
+        summary = nextSummary;
+      }
     } finally {
       isLoading = false;
     }
@@ -91,6 +99,12 @@
     if (!window.confirm(`Archive ${product.name}? Its history will remain available.`)) return;
     clearMessages();
     try { await archiveProduct(product.id); notice = `${product.name} was archived.`; await refresh(); }
+    catch (caught) { error = caught instanceof Error ? caught.message : String(caught); }
+  }
+  async function remove(product: Product) {
+    if (!window.confirm(`Permanently delete ${product.name}? This is only allowed when it has no transaction history.`)) return;
+    clearMessages();
+    try { await deleteProduct(product.id); notice = `${product.name} was deleted.`; await refresh(); }
     catch (caught) { error = caught instanceof Error ? caught.message : String(caught); }
   }
   function openMovement(type: MovementType) {
@@ -163,7 +177,7 @@
         <div class="page-heading"><div><p class="eyebrow">CATALOG</p><h1>Products</h1><p class="subtitle">Manage products, units, reorder thresholds, and history.</p></div><button class="primary" onclick={() => openProductForm()}>＋ Add product</button></div>
         <section class="panel table-panel"><div class="table-toolbar"><div class="search"><span>⌕</span><input placeholder="Search products..." bind:value={search} /></div><span class="result-count">{filteredProducts.length} active products</span></div>
           <table><thead><tr><th>PRODUCT</th><th>PRODUCT ID</th><th>UNIT</th><th>CURRENT STOCK</th><th>REORDER AT</th><th>STATUS</th><th></th></tr></thead><tbody>
-            {#each filteredProducts as product}<tr><td><strong>{product.name}</strong></td><td class="code">{product.productCode}</td><td>{product.unit}</td><td><strong>{product.currentStock}</strong></td><td>{product.reorderThreshold ?? "—"}</td><td><span class:low={product.reorderThreshold !== null && product.currentStock <= product.reorderThreshold} class="status"><i></i>{product.reorderThreshold !== null && product.currentStock <= product.reorderThreshold ? "Low stock" : "In stock"}</span></td><td class="row-actions"><button onclick={() => openProductForm(product)}>Edit</button><button onclick={() => archive(product)}>Archive</button></td></tr>{:else}<tr><td colspan="7" class="empty">No products found.</td></tr>{/each}
+            {#each filteredProducts as product}<tr><td><strong>{product.name}</strong></td><td class="code">{product.productCode}</td><td>{product.unit}</td><td><strong>{product.currentStock}</strong></td><td>{product.reorderThreshold ?? "—"}</td><td><span class:low={product.reorderThreshold !== null && product.currentStock <= product.reorderThreshold} class="status"><i></i>{product.reorderThreshold !== null && product.currentStock <= product.reorderThreshold ? "Low stock" : "In stock"}</span></td><td class="row-actions"><button onclick={() => openProductForm(product)}>Edit</button><button onclick={() => archive(product)}>Archive</button><button onclick={() => remove(product)}>Delete</button></td></tr>{:else}<tr><td colspan="7" class="empty">No products found.</td></tr>{/each}
           </tbody></table>{#if isLoading}<div class="table-loading">Refreshing inventory…</div>{/if}
         </section>
         {#if allProducts.some((product) => !product.isActive)}<p class="archived-note">{allProducts.filter((product) => !product.isActive).length} archived product(s) remain in transaction history.</p>{/if}

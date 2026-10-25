@@ -45,6 +45,7 @@ the macOS, Windows, Debian/Ubuntu, and Fedora/RHEL installers.
 ## Features
 
 - Product creation, editing, and archival without deleting history
+- Permanent deletion for products that have no transaction history
 - Atomic opening stock, purchases, sales, and signed adjustments
 - Protection against negative inventory and overselling
 - Backdated movements with separate recorded timestamps
