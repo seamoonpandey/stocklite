@@ -2,7 +2,12 @@ process.env.TZ = "Asia/Kathmandu";
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { formatDate } from "./format.ts";
+import { formatDate, localDate } from "./format.ts";
+
+test("localDate uses the local calendar day, not the UTC one", () => {
+  assert.equal(localDate(new Date("2026-10-25T20:00:00Z")), "2026-10-26");
+  assert.equal(localDate(new Date(2026, 9, 1)), "2026-10-01");
+});
 
 test("formats bare dates as local calendar days", () => {
   assert.equal(formatDate("2026-10-25"), "Oct 25, 2026");

@@ -49,6 +49,8 @@ the macOS, Windows, Debian/Ubuntu, and Fedora/RHEL installers.
 ## Features
 
 - Product creation, editing, and archival without deleting history
+- Archived product list with one-click restore
+- Low stock filter linked from the dashboard alert
 - Permanent deletion of a product together with its transaction history
 - Atomic opening stock, purchases, sales, and signed adjustments
 - Protection against negative inventory and overselling

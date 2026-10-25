@@ -216,13 +216,7 @@ fn create_product(
     }
     let mut connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
     let transaction = connection.transaction().map_err(|error| error.to_string())?;
-    let duplicate: Option<i64> = transaction
-        .query_row("SELECT id FROM products WHERE name = ?1 COLLATE NOCASE", [&name], |row| row.get(0))
-        .optional()
-        .map_err(|error| error.to_string())?;
-    if duplicate.is_some() {
-        return Err("A product with this name already exists.".to_string());
-    }
+    ensure_unique_name(&transaction, &name, None)?;
     let next_id: i64 = transaction
         .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM products", [], |row| row.get(0))
         .map_err(|error| error.to_string())?;
@@ -266,6 +260,7 @@ fn update_product(
         return Err("Reorder threshold cannot be negative.".to_string());
     }
     let connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
+    ensure_unique_name(&connection, &name, Some(product_id))?;
     let updated = connection
         .execute(
             "UPDATE products SET name = ?1, unit = ?2, reorder_threshold = ?3 WHERE id = ?4 AND is_active = 1",
@@ -278,14 +273,43 @@ fn update_product(
     get_product(&connection, product_id)
 }
 
+fn ensure_unique_name(connection: &Connection, name: &str, except_id: Option<i64>) -> Result<(), String> {
+    let existing: Option<bool> = connection
+        .query_row(
+            "SELECT is_active FROM products WHERE name = ?1 COLLATE NOCASE AND id IS NOT ?2",
+            params![name, except_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    match existing {
+        Some(true) => Err("A product with this name already exists.".to_string()),
+        Some(false) => Err("An archived product with this name already exists. Restore it from Products > Archived.".to_string()),
+        None => Ok(()),
+    }
+}
+
 #[tauri::command]
 fn archive_product(state: State<'_, AppState>, product_id: i64) -> Result<(), String> {
     let connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
+    set_archived(&connection, product_id, true)
+}
+
+#[tauri::command]
+fn unarchive_product(state: State<'_, AppState>, product_id: i64) -> Result<(), String> {
+    let connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
+    set_archived(&connection, product_id, false)
+}
+
+fn set_archived(connection: &Connection, product_id: i64, archived: bool) -> Result<(), String> {
     let changed = connection
-        .execute("UPDATE products SET is_active = 0 WHERE id = ?1 AND is_active = 1", [product_id])
+        .execute(
+            "UPDATE products SET is_active = ?1 WHERE id = ?2 AND is_active = ?3",
+            params![!archived, product_id, archived],
+        )
         .map_err(|error| error.to_string())?;
     if changed == 0 {
-        return Err("Product was not found or already archived.".to_string());
+        return Err(if archived { "Product was not found or already archived." } else { "Product was not found or is not archived." }.to_string());
     }
     Ok(())
 }
@@ -488,7 +512,8 @@ fn stock_report(connection: &Connection, from_date: &str, to_date: &str) -> Resu
     let mut statement = connection
         .prepare(
             "SELECT p.id, p.name, p.unit,
-             COALESCE((SELECT SUM(quantity_delta) FROM movements WHERE product_id = p.id AND date(occurred_at) < date(?1)), 0),
+             COALESCE((SELECT SUM(quantity_delta) FROM movements WHERE product_id = p.id AND (date(occurred_at) < date(?1)
+                       OR (movement_type = 'opening' AND date(occurred_at) <= date(?2)))), 0),
              COALESCE((SELECT SUM(quantity_delta) FROM movements WHERE product_id = p.id AND movement_type = 'purchase' AND date(occurred_at) BETWEEN date(?1) AND date(?2)), 0),
              COALESCE((SELECT SUM(-quantity_delta) FROM movements WHERE product_id = p.id AND movement_type = 'sale' AND date(occurred_at) BETWEEN date(?1) AND date(?2)), 0),
              COALESCE((SELECT SUM(quantity_delta) FROM movements WHERE product_id = p.id AND movement_type = 'adjustment' AND date(occurred_at) BETWEEN date(?1) AND date(?2)), 0),
@@ -693,8 +718,43 @@ mod tests {
         let mut connection = database();
         product_with_timestamped_opening_and_dated_purchase(&mut connection);
         let row = &stock_report(&connection, "2026-10-01", "2026-10-25").unwrap()[0];
-        assert_eq!((row.opening_balance, row.purchases, row.closing_balance), (0, 7, 1007));
+        assert_eq!((row.opening_balance, row.purchases, row.closing_balance), (1000, 7, 1007));
         assert_eq!(stock_report(&connection, "2026-10-26", "2026-10-31").unwrap()[0].opening_balance, 1007);
+    }
+
+    #[test]
+    fn report_rows_add_up_when_a_product_starts_inside_the_period() {
+        let mut connection = database();
+        product_with_timestamped_opening_and_dated_purchase(&mut connection);
+        connection.execute("INSERT INTO movements (product_id, movement_type, quantity_delta, occurred_at) VALUES (1, 'sale', -50, '2026-10-26')", []).unwrap();
+        record_movement(&mut connection, MovementInput { product_id: 1, quantity: -3, occurred_at: Some("2026-10-27".into()), note: None }, "adjustment").unwrap();
+        for (from, to) in [("2026-10-01", "2026-10-31"), ("2026-10-26", "2026-10-31"), ("2026-10-25", "2026-10-25")] {
+            let row = &stock_report(&connection, from, to).unwrap()[0];
+            assert_eq!(row.opening_balance + row.purchases - row.sales + row.adjustments, row.closing_balance, "{from}..{to}");
+        }
+    }
+
+    #[test]
+    fn archived_products_can_be_restored() {
+        let connection = database();
+        connection.execute("INSERT INTO products (product_code, name, unit) VALUES ('STK-0001', 'Rod', 'pieces')", []).unwrap();
+        set_archived(&connection, 1, true).unwrap();
+        assert!(set_archived(&connection, 1, true).is_err());
+        set_archived(&connection, 1, false).unwrap();
+        assert!(set_archived(&connection, 1, false).is_err());
+        assert!(get_product(&connection, 1).unwrap().is_active);
+    }
+
+    #[test]
+    fn product_names_stay_unique_and_point_to_archived_duplicates() {
+        let connection = database();
+        connection.execute("INSERT INTO products (product_code, name, unit) VALUES ('STK-0001', 'Rod', 'pieces')", []).unwrap();
+        connection.execute("INSERT INTO products (product_code, name, unit, is_active) VALUES ('STK-0002', 'Pipe', 'pieces', 0)", []).unwrap();
+        assert_eq!(ensure_unique_name(&connection, "ROD", None).unwrap_err(), "A product with this name already exists.");
+        assert!(ensure_unique_name(&connection, "Pipe", None).unwrap_err().contains("archived"));
+        assert!(ensure_unique_name(&connection, "Rod", Some(1)).is_ok());
+        assert!(ensure_unique_name(&connection, "Rod", Some(2)).is_err());
+        assert!(ensure_unique_name(&connection, "Bolt", None).is_ok());
     }
 }
 
@@ -720,6 +780,7 @@ pub fn run() {
             create_product,
             update_product,
             archive_product,
+            unarchive_product,
             delete_product,
             record_purchase,
             record_sale,
