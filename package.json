@@ -1,8 +1,7 @@
 {
   "name": "stocklite",
   "description": "Offline-first desktop inventory management",
-  "version": "0.1.0",
-  "description": "",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
