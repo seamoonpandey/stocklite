@@ -1,6 +1,6 @@
 [package]
 name = "stocklite"
-version = "1.0.0"
+version = "1.0.3"
 description = "Offline-first desktop inventory management"
 authors = ["you"]
 edition = "2024"

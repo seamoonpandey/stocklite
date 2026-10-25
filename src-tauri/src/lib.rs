@@ -98,6 +98,29 @@ fn initialize_database(connection: &Connection) -> rusqlite::Result<()> {
     if !has_version {
         connection.execute("INSERT INTO schema_versions (version) VALUES (1)", [])?;
     }
+
+    Ok(())
+}
+
+fn migrate_legacy_database(target_dir: &Path, legacy_dir: &Path) -> Result<(), String> {
+    let target_path = target_dir.join("stocklite.db");
+    let legacy_path = legacy_dir.join("stocklite.db");
+    if target_path.exists() || !legacy_path.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(target_dir).map_err(|error| error.to_string())?;
+    let legacy = Connection::open(&legacy_path).map_err(|error| format!("Could not open previous database: {error}"))?;
+    let integrity: String = legacy
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|error| format!("Could not verify previous database: {error}"))?;
+    if integrity != "ok" {
+        return Err(format!("Previous database failed integrity check: {integrity}"));
+    }
+    let mut target = Connection::open(&target_path).map_err(|error| error.to_string())?;
+    let backup = rusqlite::backup::Backup::new(&legacy, &mut target).map_err(|error| error.to_string())?;
+    backup
+        .run_to_completion(100, std::time::Duration::from_millis(10), None)
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -545,6 +568,22 @@ mod tests {
         connection.execute("INSERT INTO products (product_code, name, unit) VALUES ('STK-0001', 'Coffee', 'bags')", []).unwrap();
         assert_eq!(connection.query_row("SELECT COUNT(*) FROM movements", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
     }
+
+    #[test]
+    fn legacy_database_is_copied_only_when_new_location_is_empty() {
+        let root = std::env::temp_dir().join(format!("stocklite-migration-{}", std::process::id()));
+        let legacy_dir = root.join("com.stocklite.desktop");
+        let current_dir = root.join("com.stocklite.app");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy = Connection::open(legacy_dir.join("stocklite.db")).unwrap();
+        initialize_database(&legacy).unwrap();
+        legacy.execute("INSERT INTO products (product_code, name, unit) VALUES ('STK-0001', 'Legacy item', 'pieces')", []).unwrap();
+        drop(legacy);
+        migrate_legacy_database(&current_dir, &legacy_dir).unwrap();
+        let migrated = Connection::open(current_dir.join("stocklite.db")).unwrap();
+        assert_eq!(migrated.query_row("SELECT name FROM products", [], |row| row.get::<_, String>(0)).unwrap(), "Legacy item");
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -553,6 +592,10 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
             fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
+            if let Some(parent) = data_dir.parent() {
+                let legacy_dir = parent.join("com.stocklite.desktop");
+                migrate_legacy_database(&data_dir, &legacy_dir)?;
+            }
             let database_path = data_dir.join("stocklite.db");
             let connection = Connection::open(database_path).map_err(|error| error.to_string())?;
             initialize_database(&connection).map_err(|error| error.to_string())?;
