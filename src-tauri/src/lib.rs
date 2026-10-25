@@ -292,20 +292,22 @@ fn archive_product(state: State<'_, AppState>, product_id: i64) -> Result<(), St
 
 #[tauri::command]
 fn delete_product(state: State<'_, AppState>, product_id: i64) -> Result<(), String> {
-    let connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
-    let movement_count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM movements WHERE product_id = ?1", [product_id], |row| row.get(0))
+    let mut connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
+    delete_product_and_history(&mut connection, product_id)
+}
+
+fn delete_product_and_history(connection: &mut Connection, product_id: i64) -> Result<(), String> {
+    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    transaction
+        .execute("DELETE FROM movements WHERE product_id = ?1", [product_id])
         .map_err(|error| error.to_string())?;
-    if movement_count > 0 {
-        return Err("This product has transaction history and cannot be deleted. Archive it instead.".to_string());
-    }
-    let deleted = connection
+    let deleted = transaction
         .execute("DELETE FROM products WHERE id = ?1", [product_id])
         .map_err(|error| error.to_string())?;
     if deleted == 0 {
         return Err("Product was not found.".to_string());
     }
-    Ok(())
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn get_product(connection: &Connection, product_id: i64) -> Result<Product, String> {
@@ -638,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn product_fields_are_normalized_and_history_blocks_deletion() {
+    fn product_fields_are_normalized_and_history_is_recorded() {
         let (name, unit) = normalize_product_fields("  arabica COFFEE beans ", " BAGS ");
         assert_eq!(name, "Arabica Coffee Beans");
         assert_eq!(unit, "bags");
@@ -660,6 +662,23 @@ mod tests {
             )
             .unwrap();
         record_movement(connection, MovementInput { product_id, quantity: 7, occurred_at: Some("2026-10-25".into()), note: None }, "purchase").unwrap();
+    }
+
+    #[test]
+    fn deleting_a_product_removes_its_history_only() {
+        let mut connection = database();
+        for (code, name) in [("STK-0001", "Rod"), ("STK-0002", "Pipe")] {
+            connection.execute("INSERT INTO products (product_code, name, unit) VALUES (?1, ?2, 'pieces')", [code, name]).unwrap();
+            let product_id = connection.last_insert_rowid();
+            record_movement(&mut connection, MovementInput { product_id, quantity: 10, occurred_at: None, note: None }, "opening").unwrap();
+            record_movement(&mut connection, MovementInput { product_id, quantity: 4, occurred_at: None, note: None }, "sale").unwrap();
+        }
+        delete_product_and_history(&mut connection, 1).unwrap();
+        let count = |sql: &str| connection.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap();
+        assert_eq!(count("SELECT COUNT(*) FROM products WHERE id = 1"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM movements WHERE product_id = 1"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM movements WHERE product_id = 2"), 2);
+        assert!(delete_product_and_history(&mut connection, 1).is_err());
     }
 
     #[test]
