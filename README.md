@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/banner.jpeg" alt="StockLite: local, simple, reliable inventory" width="640">
+</p>
+
 # StockLite
 
 StockLite is a simple offline inventory app for products, purchases, sales,
