@@ -22,7 +22,7 @@ async function call<T>(command: string, args: Record<string, unknown>, fallback:
 }
 
 export const listProducts = (search = "", includeInactive = false) =>
-  call<Product[]>("list_products", { search, include_inactive: includeInactive }, demoProducts.filter((product) =>
+  call<Product[]>("list_products", { search, includeInactive }, demoProducts.filter((product) =>
     `${product.name} ${product.productCode}`.toLowerCase().includes(search.toLowerCase()),
   ));
 
@@ -32,10 +32,10 @@ export const listMovements = (filters: {
   fromDate?: string;
   toDate?: string;
 } = {}) => call<Movement[]>("list_movements", {
-  product_id: filters.productId ?? null,
-  movement_type: filters.movementType || null,
-  from_date: filters.fromDate || null,
-  to_date: filters.toDate || null,
+productId: filters.productId ?? null,
+movementType: filters.movementType || null,
+fromDate: filters.fromDate || null,
+toDate: filters.toDate || null,
 }, demoMovements);
 
 export const getDashboardSummary = () =>
@@ -55,8 +55,8 @@ export const createProduct = (input: {
   call<Product>("create_product", {
     name: input.name,
     unit: input.unit,
-    opening_quantity: input.openingQuantity,
-    reorder_threshold: input.reorderThreshold,
+    openingQuantity: input.openingQuantity,
+    reorderThreshold: input.reorderThreshold,
   }, {
     id: Date.now(), productCode: `STK-${String(Date.now()).slice(-4)}`, name: input.name, unit: input.unit,
     currentStock: input.openingQuantity, reorderThreshold: input.reorderThreshold, isActive: true,
@@ -69,10 +69,10 @@ export const updateProduct = (input: {
   reorderThreshold: number | null;
 }) =>
   call<Product>("update_product", {
-    product_id: input.productId,
+    productId: input.productId,
     name: input.name,
     unit: input.unit,
-    reorder_threshold: input.reorderThreshold,
+    reorderThreshold: input.reorderThreshold,
   }, {
     ...demoProducts.find((product) => product.id === input.productId) ?? demoProducts[0],
     name: input.name,
@@ -80,7 +80,7 @@ export const updateProduct = (input: {
     reorderThreshold: input.reorderThreshold,
   });
 
-export const archiveProduct = (productId: number) => call<void>("archive_product", { product_id: productId }, undefined);
+export const archiveProduct = (productId: number) => call<void>("archive_product", { productId }, undefined);
 
 export const recordMovement = (type: "purchase" | "sale" | "adjustment", input: {
   productId: number;
@@ -90,15 +90,15 @@ export const recordMovement = (type: "purchase" | "sale" | "adjustment", input: 
 }) =>
   call<Product>(`record_${type}`, {
     input: {
-      product_id: input.productId,
+      productId: input.productId,
       quantity: input.quantity,
-      occurred_at: input.occurredAt,
+      occurredAt: input.occurredAt,
       note: input.note || null,
     },
   }, demoProducts.find((product) => product.id === input.productId) ?? demoProducts[0]);
 
 export const getStockReport = (fromDate: string, toDate: string) =>
-  call<StockReportRow[]>("get_stock_report", { from_date: fromDate, to_date: toDate }, []);
+  call<StockReportRow[]>("get_stock_report", { fromDate, toDate }, []);
 
 export const createBackup = (destination: string) => call<string>("create_backup", { destination }, destination);
 export const restoreBackup = (source: string) => call<void>("restore_backup", { source }, undefined);
