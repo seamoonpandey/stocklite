@@ -415,7 +415,7 @@ fn list_movements(
                AND (?2 IS NULL OR m.movement_type = ?2)
                AND (?3 IS NULL OR date(m.occurred_at) >= date(?3))
                AND (?4 IS NULL OR date(m.occurred_at) <= date(?4))
-             ORDER BY m.occurred_at DESC, m.id DESC LIMIT 500",
+             ORDER BY date(m.occurred_at) DESC, m.id DESC LIMIT 500",
         )
         .map_err(|error| error.to_string())?;
     statement
@@ -459,7 +459,7 @@ fn query_movements(connection: &Connection, limit: i64) -> Result<Vec<Movement>,
             "SELECT m.id, m.product_id, p.name, m.movement_type, m.quantity_delta,
                     m.occurred_at, m.created_at, m.note
              FROM movements m JOIN products p ON p.id = m.product_id
-             ORDER BY m.occurred_at DESC, m.id DESC LIMIT ?1",
+             ORDER BY date(m.occurred_at) DESC, m.id DESC LIMIT ?1",
         )
         .map_err(|error| error.to_string())?;
     statement
@@ -479,14 +479,18 @@ fn get_stock_report(
         return Err("The report start date must be before its end date.".to_string());
     }
     let connection = state.0.lock().map_err(|_| "Database is unavailable".to_string())?;
+    stock_report(&connection, &from_date, &to_date)
+}
+
+fn stock_report(connection: &Connection, from_date: &str, to_date: &str) -> Result<Vec<StockReportRow>, String> {
     let mut statement = connection
         .prepare(
             "SELECT p.id, p.name, p.unit,
-             COALESCE((SELECT SUM(quantity_delta) FROM movements WHERE product_id = p.id AND occurred_at < ?1), 0),
+             COALESCE((SELECT SUM(quantity_delta) FROM movements WHERE product_id = p.id AND date(occurred_at) < date(?1)), 0),
              COALESCE((SELECT SUM(quantity_delta) FROM movements WHERE product_id = p.id AND movement_type = 'purchase' AND date(occurred_at) BETWEEN date(?1) AND date(?2)), 0),
              COALESCE((SELECT SUM(-quantity_delta) FROM movements WHERE product_id = p.id AND movement_type = 'sale' AND date(occurred_at) BETWEEN date(?1) AND date(?2)), 0),
              COALESCE((SELECT SUM(quantity_delta) FROM movements WHERE product_id = p.id AND movement_type = 'adjustment' AND date(occurred_at) BETWEEN date(?1) AND date(?2)), 0),
-             COALESCE((SELECT SUM(quantity_delta) FROM movements WHERE product_id = p.id AND occurred_at <= ?2), 0)
+             COALESCE((SELECT SUM(quantity_delta) FROM movements WHERE product_id = p.id AND date(occurred_at) <= date(?2)), 0)
              FROM products p WHERE p.is_active = 1 ORDER BY p.name",
         )
         .map_err(|error| error.to_string())?;
@@ -644,6 +648,34 @@ mod tests {
         record_movement(&mut connection, MovementInput { product_id, quantity: 1, occurred_at: None, note: None }, "opening").unwrap();
         let history_count: i64 = connection.query_row("SELECT COUNT(*) FROM movements WHERE product_id = ?1", [product_id], |row| row.get(0)).unwrap();
         assert_eq!(history_count, 1);
+    }
+
+    fn product_with_timestamped_opening_and_dated_purchase(connection: &mut Connection) {
+        connection.execute("INSERT INTO products (product_code, name, unit) VALUES ('STK-0001', 'Rod', 'pieces')", []).unwrap();
+        let product_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO movements (product_id, movement_type, quantity_delta, occurred_at) VALUES (?1, 'opening', 1000, '2026-10-25 10:18:23')",
+                [product_id],
+            )
+            .unwrap();
+        record_movement(connection, MovementInput { product_id, quantity: 7, occurred_at: Some("2026-10-25".into()), note: None }, "purchase").unwrap();
+    }
+
+    #[test]
+    fn newest_movement_comes_first_across_timestamp_formats() {
+        let mut connection = database();
+        product_with_timestamped_opening_and_dated_purchase(&mut connection);
+        assert_eq!(query_movements(&connection, 5).unwrap()[0].movement_type, "purchase");
+    }
+
+    #[test]
+    fn report_includes_timestamped_movements_on_boundary_days() {
+        let mut connection = database();
+        product_with_timestamped_opening_and_dated_purchase(&mut connection);
+        let row = &stock_report(&connection, "2026-10-01", "2026-10-25").unwrap()[0];
+        assert_eq!((row.opening_balance, row.purchases, row.closing_balance), (0, 7, 1007));
+        assert_eq!(stock_report(&connection, "2026-10-26", "2026-10-31").unwrap()[0].opening_balance, 1007);
     }
 }
 

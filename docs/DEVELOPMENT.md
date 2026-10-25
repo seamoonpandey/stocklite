@@ -21,6 +21,7 @@ because SQLite commands run inside Tauri, not in a browser tab.
 Run the same checks used before release:
 
 ```bash
+npm test
 npm run check
 npm run build
 cargo test --manifest-path src-tauri/Cargo.toml

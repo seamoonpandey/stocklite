@@ -4,6 +4,7 @@
     archiveProduct, createBackup, createProduct, deleteProduct, getDashboardSummary, getDatabasePath,
     getStockReport, listMovements, listProducts, recordMovement, restoreBackup, updateProduct,
   } from "$lib/api";
+  import { formatDate } from "$lib/format";
   import type { DashboardSummary, Movement, Product, StockReportRow } from "$lib/types";
   import "$lib/../app.css";
 
@@ -134,10 +135,6 @@
     if (!window.confirm("Restore this backup? Current data will be replaced. Make a backup first.")) return;
     try { if (!restorePath.trim()) throw new Error("Enter a .db backup path."); await restoreBackup(restorePath.trim()); notice = "Backup restored successfully."; await refresh(); }
     catch (caught) { error = caught instanceof Error ? caught.message : String(caught); }
-  }
-  function formatDate(value: string) {
-    const date = new Date(value.includes("T") ? value : `${value}T00:00:00`);
-    return new Intl.DateTimeFormat("en", { month: "short", day: "numeric", year: "numeric" }).format(date);
   }
   function movementLabel(type: string) { return type === "purchase" ? "Purchase" : type === "sale" ? "Sale" : type === "opening" ? "Opening stock" : "Adjustment"; }
   function closeModal() { showProductForm = false; showEditForm = false; showMovementForm = false; error = ""; }
